@@ -106,6 +106,123 @@ if (video_data.params.quality === 'dash') {
     player.reloadSourceOnError({
         errorInterval: 10
     });
+
+    /**
+     * videoplayback links are only valid for a few hours. Once they have expired (or
+     * fail for any other reason) VHS keeps cycling through its renditions with no delay
+     * and without ever raising a player error, so the handlers above never run and the
+     * server is flooded with requests for as long as the tab stays open.
+     *
+     * Watch for that, and reload the manifest to get fresh links. If a few reloads in
+     * a row don't bring playback back, stop loading and show an error instead.
+     */
+    var dash_recovery = {
+        FAILURE_LIMIT: 5,                  // rendition failures...
+        FAILURE_WINDOW: 10 * 1000,         // ...within this many ms trigger a reload
+        RELOAD_DELAYS: [0, 5000, 15000],   // wait before each consecutive reload attempt
+        PROGRESS_NEEDED: 5,                // seconds played after a reload to call it a success
+
+        failures: [],
+        attempts: 0,
+        waiting: false,
+        given_up: false,
+        resumed_at: 0,
+        pending_state: null,               // position to restore once a reload has loaded
+        bound_tech: null
+    };
+
+    var dash_stop_loading = function () {
+        var tech = player.tech({ IWillNotUseThisInPlugins: true });
+        var controller = tech && tech.vhs && tech.vhs.masterPlaylistController_;
+        if (controller && typeof controller.pauseLoading === 'function') controller.pauseLoading();
+    };
+
+    var dash_give_up = function () {
+        dash_recovery.given_up = true;
+        // Keep reloadSourceOnError from restarting the source because of the error below.
+        player.reloadSourceOnError({ getSource: function () {} });
+        player.pause();
+        player.error({
+            code: MediaError.MEDIA_ERR_NETWORK,
+            message: 'The video stream stopped responding. Reload the page to continue.'
+        });
+    };
+
+    var dash_restore_state = function () {
+        var state = dash_recovery.pending_state;
+        if (!state) return;
+        dash_recovery.pending_state = null;
+        player.currentTime(state.currentTime);
+        player.playbackRate(state.playbackRate);
+    };
+
+    var dash_reload_source = function (sources, state) {
+        dash_recovery.waiting = false;
+        dash_recovery.failures = [];
+        dash_recovery.resumed_at = state.currentTime;
+        dash_recovery.pending_state = state;
+
+        console.warn('Video stream requests keep failing, reloading the manifest...');
+
+        player.off('loadedmetadata', dash_restore_state);
+        player.one('loadedmetadata', dash_restore_state);
+        player.src(sources);
+        if (!state.paused) player.play();
+    };
+
+    var dash_on_rendition_failure = function () {
+        // VHS resumes loading right after this event, so stopping has to wait a tick.
+        if (dash_recovery.waiting || dash_recovery.given_up) {
+            setTimeout(dash_stop_loading, 0);
+            return;
+        }
+
+        var now = Date.now();
+        dash_recovery.failures.push(now);
+        dash_recovery.failures = dash_recovery.failures.filter(function (time) {
+            return now - time <= dash_recovery.FAILURE_WINDOW;
+        });
+        if (dash_recovery.failures.length < dash_recovery.FAILURE_LIMIT) return;
+
+        dash_recovery.failures = [];
+        setTimeout(dash_stop_loading, 0);
+
+        if (dash_recovery.attempts >= dash_recovery.RELOAD_DELAYS.length) {
+            dash_give_up();
+            return;
+        }
+
+        var sources = player.currentSources();
+        // If the previous reload never got as far as playing, the player has no
+        // position of its own yet: keep the one saved before that reload.
+        var state = dash_recovery.pending_state || {
+            currentTime: player.currentTime(),
+            playbackRate: player.playbackRate(),
+            paused: player.paused()
+        };
+
+        dash_recovery.waiting = true;
+        setTimeout(function () {
+            dash_reload_source(sources, state);
+        }, dash_recovery.RELOAD_DELAYS[dash_recovery.attempts++]);
+    };
+
+    var dash_bind_tech = function () {
+        var tech = player.tech({ IWillNotUseThisInPlugins: true });
+        if (!tech || tech === dash_recovery.bound_tech) return;
+        dash_recovery.bound_tech = tech;
+        tech.on('blacklistplaylist', dash_on_rendition_failure);
+    };
+
+    player.ready(dash_bind_tech);
+    player.on('loadstart', dash_bind_tech);
+
+    // Playback moving forward again after a reload means the reload worked.
+    player.on('timeupdate', function () {
+        if (dash_recovery.attempts === 0 || dash_recovery.waiting || dash_recovery.given_up) return;
+        if (player.currentTime() > dash_recovery.resumed_at + dash_recovery.PROGRESS_NEEDED)
+            dash_recovery.attempts = 0;
+    });
 }
 
 /**
