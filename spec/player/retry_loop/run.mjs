@@ -9,6 +9,8 @@
 //   dead      working-tree player.js; links expire and never work again
 //   dead-media  working-tree player.js; after expiry the manifest and stream
 //             headers still load, but every media segment is rejected
+//   dead-network  like dead-media, but the connection is dropped instead of
+//             answering 400 (what a blocked or unreachable request looks like)
 //   outage    working-tree player.js; media is rejected for a while, then works
 //             again; playback must resume from where it stopped
 //   normal    working-tree player.js; links never expire (false-positive check)
@@ -30,17 +32,17 @@ const MODE = process.argv[2] || "fixed";
 const BASELINE_REF = process.env.BASELINE_REF || "upstream/master";
 
 // How long generated links stay valid, in seconds.
-const TTL = MODE === "normal" ? 3600 : 8;
+const TTL = process.env.TTL !== undefined ? Number(process.env.TTL) : (MODE === "normal" ? 3600 : 8);
 // How long the browser is left running, in seconds.
 const RUN_SECONDS = Number(process.env.RUN_SECONDS) ||
-    { baseline: 25, fixed: 40, dead: 75, "dead-media": 75, outage: 60, normal: 25 }[MODE];
+    { baseline: 25, fixed: 40, dead: 75, "dead-media": 75, "dead-network": 75, outage: 60, normal: 25 }[MODE];
 // "outage" mode: how long media stays unavailable after the first TTL.
 const OUTAGE_SECONDS = 14;
 // Length of the generated test video, in seconds.
 const VIDEO_SECONDS = 180;
 
-if (!(MODE in { baseline: 1, fixed: 1, dead: 1, "dead-media": 1, outage: 1, normal: 1 })) {
-    console.error("usage: run.mjs baseline|fixed|dead|dead-media|outage|normal");
+if (!(MODE in { baseline: 1, fixed: 1, dead: 1, "dead-media": 1, "dead-network": 1, outage: 1, normal: 1 })) {
+    console.error("usage: run.mjs baseline|fixed|dead|dead-media|dead-network|outage|normal");
     process.exit(2);
 }
 
@@ -320,7 +322,7 @@ function startServer(deps) {
             const afterFirstTtl = now > firstManifestAt + TTL * 1000;
             const isMedia = start > stream.indexRange[1];
             const inOutage = afterFirstTtl && now < firstManifestAt + (TTL + OUTAGE_SECONDS) * 1000;
-            const dead = (afterFirstTtl && (MODE === "dead" || (MODE === "dead-media" && isMedia))) ||
+            const dead = (afterFirstTtl && (MODE === "dead" || ((MODE === "dead-media" || MODE === "dead-network") && isMedia))) ||
                 (MODE === "outage" && inOutage && isMedia);
             if (expired || dead) {
                 stats.rejected++;
@@ -328,6 +330,7 @@ function startServer(deps) {
                 stats.lastRejectionAt = now;
                 const sec = Math.floor((now - stats.firstRejectionAt) / 1000);
                 stats.rejectedPerSecond[sec] = (stats.rejectedPerSecond[sec] || 0) + 1;
+                if (MODE === "dead-network" || process.env.DROP) return void req.socket.destroy();
                 // Same status and body as invidious-companion's videoplayback proxy.
                 return send(400, "text/plain",
                     "Expire query string undefined or videoplayback URL has expired.");
@@ -457,11 +460,11 @@ if (MODE === "baseline") {
     check(maxTime > TTL + 10, `expected playback to continue well past expiry, reached ${maxTime.toFixed(1)}s`);
     check(advancingAtEnd, "expected playback to still be advancing at the end of the run");
     check(!last.error, "expected no player error");
-} else if (MODE === "dead" || MODE === "dead-media") {
+} else if (MODE === "dead" || MODE === "dead-media" || MODE === "dead-network") {
     check(stats.rejected <= 60, `expected at most 60 rejected requests, got ${stats.rejected}`);
     check(quietSeconds !== null && quietSeconds >= 15, `expected requests to have stopped for 15s+, quiet for ${quietSeconds}`);
     check(!!last.error, "expected the player to show an error");
-    if (MODE === "dead-media") {
+    if (MODE !== "dead") {
         check(stats.manifestFetches === 4, `expected 3 reload attempts (4 manifest fetches), got ${stats.manifestFetches}`);
         check(/stopped responding/.test(last.error?.message || ""), "expected the give-up error message");
     }

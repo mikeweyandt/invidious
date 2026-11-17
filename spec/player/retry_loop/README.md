@@ -21,6 +21,7 @@ node spec/player/retry_loop/run.mjs <mode>
 | `outage`     | working tree      | media is rejected for 14 s, then works again                 | playback resumes from where it stopped, no error              |
 | `dead`       | working tree      | everything is rejected after 8 s                             | requests stop and the player shows an error                   |
 | `dead-media` | working tree      | manifest and stream headers load, media segments are rejected | three reload attempts, then requests stop with an error      |
+| `dead-network` | working tree    | like `dead-media`, but connections are dropped (no response) | three reload attempts, then requests stop with an error      |
 | `normal`     | working tree      | links never expire                                           | no rejections, no reloads                                     |
 
 Each run prints a JSON summary (request counts, player events, final error)
@@ -37,7 +38,12 @@ followed by `PASS` or `FAIL` and exits non-zero on failure.
 Downloads and the generated test video are cached in the system temp
 directory under `invidious-player-retry-loop-test`.
 
-Other options: `BASELINE_REF` (git ref used by `baseline`), `RUN_SECONDS`.
+Other options:
+
+- `BASELINE_REF`: git ref used by `baseline`
+- `RUN_SECONDS`: how long the browser is left running
+- `TTL`: seconds until links stop working (`TTL=0` fails from the first request)
+- `DROP=1`: drop the connection instead of answering `400`, in any mode
 
 ## How it works
 
